@@ -1,14 +1,10 @@
 # -*- coding: utf-8 -*-
 """
-Main Optimization Client (Corrected)
+Main Optimization Client with Knowledge Base and Key-Point Loss Function
 
-This script runs in a standard Python environment and acts as the client.
-It connects to the PFC server, sends parameter sets for evaluation, and
-drives the Bayesian optimization loop.
-
-This version includes a fix for the column name mismatch, the unit conversion
-for the target data file, and a robust server connection handling mechanism
-with timeouts and a server list.
+This version automatically finds and processes all target curve files (.csv)
+in the 'target_data' directory, running a full optimization for each one.
+It uses a fast, key-point based loss function and a persistent knowledge base.
 """
 import os
 import json
@@ -18,31 +14,31 @@ from skopt import gp_minimize
 from skopt.space import Real
 from skopt.utils import use_named_args
 
-# --- Import custom modules from the 'source_code' directory ---
-from source_code.loss_functions import dtw_distance
+# --- Import custom modules ---
+from source_code.loss_functions import calculate_keypoint_loss
 from source_code.utilities import setup_results_directory, save_best_parameters, plot_convergence, plot_comparison_curve
+from source_code.knowledge_base_manager import warm_start_optimizer, load_from_knowledge_base, save_to_knowledge_base
 
 # =============================================================================
 # --- CONFIGURATION ---
 # =============================================================================
-
 # 1. PFC Server Connection Settings
-# 可用的PFC服务器列表，格式为 (IP地址, 端口号) 的元组列表
-SERVER_LIST = [
-    ('127.0.0.1', 50009),
-    # ('127.0.0.1', 50010), # 可以添加更多服务器
-]
-# 连接和接收确认消息的超时时间 (秒)
+SERVER_LIST = [('127.0.0.1', 50001)]
 CONNECTION_TIMEOUT = 10
 
 # 2. File Paths
-TARGET_CURVE_PATH = os.path.join("target_data", "111.txt.csv")
+# The script will now automatically scan this directory for target files.
+TARGET_DATA_DIR = "target_data"
 
 # 3. Bayesian Optimization Settings
-N_CALLS = 50
-N_INITIAL_POINTS = 10
+N_CALLS = 10
+N_INITIAL_POINTS = 5
 
-# 4. PFC Micro-parameter Space
+# 4. Key-Point Loss Function Settings
+W_PEAK_POINT = 1.0
+W_MAX_STRAIN = 1.0
+
+# 5. PFC Micro-parameter Space
 PARAMETER_SPACE = [
     Real(1e9, 50e9, name='emod'),
     Real(1.0, 5.0, name='kratio'),
@@ -53,179 +49,157 @@ PARAMETER_SPACE = [
 ]
 
 # =============================================================================
-# --- GLOBAL VARIABLES AND SETUP ---
-# =============================================================================
-
-iteration_counter = 0
-
-# Load the target experimental curve once at the start.
-try:
-    target_df = pd.read_csv(TARGET_CURVE_PATH)
-    
-    # Rename the stress column to be consistent.
-    if 'Stress(Pa)' in target_df.columns:
-        target_df.rename(columns={'Stress(Pa)': 'Stress'}, inplace=True)
-        print("成功将目标数据中的列名 'Stress(Pa)' 重命名为 'Stress'。")
-
-    # Convert target stress from Pa to MPa.
-    if 'Stress' in target_df.columns:
-        target_df['Stress'] = target_df['Stress'] / 1e6
-        print("成功将目标数据的应力单位从 Pa 转换为 MPa。")
-
-    # Convert to the NumPy array format required by the DTW function
-    s_target = target_df[['Strain', 'Stress']].values.T
-    print(f"成功从 '{TARGET_CURVE_PATH}' 加载并处理了目标曲线。")
-except FileNotFoundError:
-    print(f"[错误] 目标曲线文件 '{TARGET_CURVE_PATH}' 未找到。请先运行数据预处理脚本。")
-    exit()
-except KeyError:
-    print(f"[错误] 目标文件必须包含 'Strain' 和 'Stress(Pa)' 列。")
-    exit()
-
-
-# Create a results directory for this optimization run.
-results_dir, curves_dir = setup_results_directory()
-print(f"本次运行的结果将保存在: '{results_dir}'")
-
-
-# =============================================================================
 # --- CORE FUNCTIONS ---
 # =============================================================================
 
-def evaluate_parameters_via_socket(params):
+def run_simulation(params_dict):
     """
-    从服务器列表中连接一个可用的PFC服务器，发送参数，等待确认，然后获取模拟结果。
-    本函数会处理超时，并在当前服务器繁忙或离线时尝试连接下一个。
+    Manages running a simulation: checks cache, else connects to a PFC server.
     """
-    params_json = json.dumps(params)
-    
+    cached_result = load_from_knowledge_base(params_dict)
+    if cached_result is not None:
+        return cached_result
+
+    print("  -> Cache miss. Connecting to PFC server for simulation...")
+    params_json = json.dumps(params_dict)
     for host, port in SERVER_LIST:
         try:
             with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-                # 为初始连接和ACK确认设置一个较短的超时
                 s.settimeout(CONNECTION_TIMEOUT)
-                
-                print(f"  正在尝试连接PFC服务器 -> {host}:{port}...")
                 s.connect((host, port))
-                
-                # 发送参数
                 s.sendall(params_json.encode('utf-8'))
-                print("  参数已发送，等待服务器确认...")
-
-                # 等待确认消息
                 ack = s.recv(1024)
                 if ack == b'ACK_RECEIVED':
-                    print(f"  已收到来自 {host}:{port} 的确认。服务器正在计算...")
-                    # 为接收最终结果设置一个更长的超时（None代表无限等待）
-                    s.settimeout(None) 
-                    
-                    # 接收最终结果
+                    s.settimeout(None)
                     fragments = []
                     while True:
                         chunk = s.recv(4096)
-                        if not chunk:
-                            break
+                        if not chunk: break
                         fragments.append(chunk)
-                    
                     data = b"".join(fragments).decode('utf-8')
-                    print("  结果已接收。")
+                    sim_df = pd.DataFrame(json.loads(data))
                     
-                    data_dict = json.loads(data)
-                    sim_df = pd.DataFrame(data_dict)
-                    return sim_df # 成功获取结果，退出循环和函数
-                else:
-                    print(f"  从 {host}:{port} 收到意外的回复。正在尝试下一个服务器。")
-                    continue
-
-        except socket.timeout:
-            print(f"  连接到 {host}:{port} 超时。服务器可能正忙或已离线。正在尝试下一个服务器。")
-            continue
-        except ConnectionRefusedError:
-            print(f"  连接到 {host}:{port} 被拒绝。服务器已离线。正在尝试下一个服务器。")
-            continue
+                    if not sim_df.empty:
+                        save_to_knowledge_base(params_dict, sim_df)
+                    return sim_df
         except Exception as e:
-            print(f"  与 {host}:{port} 通信时发生意外错误: {e}。正在尝试下一个服务器。")
+            print(f"  -> Server {host}:{port} failed: {e}. Trying next.")
             continue
-
-    # 如果循环完成仍未返回，说明所有服务器都连接失败
-    print("\n[致命错误] 列表中的所有PFC服务器均无响应。")
-    raise ConnectionError("无法连接到任何PFC服务器。")
-
-
-@use_named_args(dimensions=PARAMETER_SPACE)
-def objective_function(**params):
-    """
-    优化器将尝试最小化此目标函数的返回值。
-    """
-    global iteration_counter
-    iteration_counter += 1
-    print(f"\n--- 第 {iteration_counter}/{N_CALLS} 次迭代 ---")
-    print(f"测试参数: {params}")
-
-    loss = 1e10  # 模拟失败时的默认巨大损失值
-    try:
-        # 1. 通过socket调用PFC服务器进行计算
-        sim_df = evaluate_parameters_via_socket(params)
-        
-        # 2. 检查模拟是否成功并返回了有效数据
-        if sim_df.empty or sim_df.shape[0] < 5:
-            print("  -> 模拟失败或未生成有效数据。")
-            return loss
-
-        # 3. 计算模拟曲线与目标曲线的DTW误差
-        s_simulated = sim_df[['Strain', 'Stress']].values.T
-        loss = dtw_distance(s_target, s_simulated)
-        print(f"  -> 模拟成功。DTW 误差 = {loss:.4f}")
-
-        # 4. 绘制并保存本次迭代的曲线对比图
-        plot_path = os.path.join(curves_dir, f"iteration_{iteration_counter}.png")
-        plot_comparison_curve(sim_df, target_df, iteration_counter, loss, plot_path)
-
-    except ConnectionError as e:
-        print(f"\n[致命错误] {e}")
-        raise # 重新抛出异常以终止优化过程
-    except Exception as e:
-        print(f"  -> [错误] 发生意外错误: {e}")
-
-    return loss
+    
+    return pd.DataFrame()
 
 # =============================================================================
 # --- MAIN EXECUTION BLOCK ---
 # =============================================================================
 
 if __name__ == '__main__':
-    print("\n=========================================================")
-    print("===           启动贝叶斯优化客户端程序            ===")
-    print(f"===  尝试连接PFC服务器列表...  ===")
-    print("=========================================================\n")
-
+    # --- Find all target files in the directory ---
     try:
-        result = gp_minimize(
-            func=objective_function,
-            dimensions=PARAMETER_SPACE,
-            n_calls=N_CALLS,
-            n_initial_points=N_INITIAL_POINTS,
-            random_state=123,
-            verbose=True
-        )
-        
-        print("\n=========================================================")
-        print("===                   优化完成                   ===")
+        target_files = [f for f in os.listdir(TARGET_DATA_DIR) if f.endswith('.csv')]
+        if not target_files:
+            print(f"[致命错误] 在 '{TARGET_DATA_DIR}' 目录中未找到任何 .csv 目标文件。")
+            exit()
+    except FileNotFoundError:
+        print(f"[致命错误] 目标数据目录 '{TARGET_DATA_DIR}' 不存在。")
+        exit()
+
+    print(f"发现 {len(target_files)} 个目标文件，将依次进行优化: {target_files}")
+
+    # --- Main loop to iterate over each target file ---
+    for target_filename in target_files:
+        print(f"\n\n=========================================================")
+        print(f"===      开始优化目标: {target_filename}      ===")
         print("=========================================================\n")
 
-        best_params_dict = {p.name: v for p, v in zip(PARAMETER_SPACE, result.x)}
-
-        print(f"达到的最小DTW误差: {result.fun:.4f}")
-        print("找到的最佳参数组合:")
-        print(json.dumps(best_params_dict, indent=4))
+        # Reset global counter for each new target
+        iteration_counter = 0
         
-        param_filepath = os.path.join(results_dir, "best_parameters.json")
-        save_best_parameters(best_params_dict, param_filepath)
+        # Construct full path for the current target
+        target_curve_path = os.path.join(TARGET_DATA_DIR, target_filename)
+
+        # Load and process the current target curve
+        try:
+            target_df = pd.read_csv(target_curve_path)
+            
+            if 'Stress(Pa)' in target_df.columns:
+                target_df.rename(columns={'Stress(Pa)': 'Stress'}, inplace=True)
+            target_df['Stress'] /= 1e6 # Pa to MPa
+            s_target = target_df[['Strain', 'Stress']].values.T
+            print(f"成功从 '{target_curve_path}' 加载并处理了目标曲线。")
+        except Exception as e:
+            print(f"[错误] 加载目标文件 '{target_filename}' 失败: {e}. 跳过此文件。")
+            continue # Skip to the next file
+
+        # Create a unique results directory for this specific target file
+        results_dir, curves_dir = setup_results_directory(target_filename)
+        print(f"本次运行的结果将保存在: '{results_dir}'")
+
+        # Define the objective function within this loop's scope.
+        # This allows it to "capture" the correct s_target, target_df, etc. for each run.
+        @use_named_args(dimensions=PARAMETER_SPACE)
+        def objective_function(**params):
+            global iteration_counter
+            iteration_counter += 1
+            print(f"\n--- Iteration {iteration_counter}/{N_CALLS} (New Simulation) ---")
+            print(f"Testing parameters: {params}")
+
+            loss = 1e10
+            try:
+                sim_df = run_simulation(params)
+                if sim_df.empty or sim_df.shape[0] < 5:
+                    print("  -> Simulation failed or produced insufficient data.")
+                    return loss
+
+                s_simulated = sim_df[['Strain', 'Stress']].values.T
+                loss = calculate_keypoint_loss(s_target, s_simulated, 
+                                               w_peak_point=W_PEAK_POINT, 
+                                               w_max_strain=W_MAX_STRAIN)
+                print(f"  -> Key-Point Loss = {loss:.4f}")
+
+                plot_path = os.path.join(curves_dir, f"iteration_{iteration_counter}.png")
+                plot_comparison_curve(sim_df, target_df, iteration_counter, loss, plot_path)
+            except Exception as e:
+                print(f"  -> [ERROR] An unexpected error occurred in objective function: {e}")
+            return loss
+
+        # --- 1. WARM-START: Load prior knowledge for the current target ---
+        x_prior, y_prior = warm_start_optimizer(PARAMETER_SPACE, s_target, 
+                                                w_peak_point=W_PEAK_POINT,
+                                                w_max_strain=W_MAX_STRAIN)
         
-        convergence_filepath = os.path.join(results_dir, "convergence_plot.png")
-        plot_convergence(result, convergence_filepath)
+        n_initial = 0 if x_prior else N_INITIAL_POINTS
 
-    except Exception as e:
-        print(f"\n[严重] 优化进程因错误而终止: {e}")
+        try:
+            # --- 2. RUN OPTIMIZATION for the current target ---
+            result = gp_minimize(
+                func=objective_function,
+                dimensions=PARAMETER_SPACE,
+                x0=x_prior if x_prior else None,
+                y0=y_prior if y_prior else None,
+                n_calls=N_CALLS,
+                n_initial_points=n_initial,
+                random_state=123,
+                verbose=True
+            )
+            
+            print("\n---------------------------------------------------------")
+            print(f"---           优化完成: {target_filename}           ---")
+            print("---------------------------------------------------------\n")
 
-    print(f"\n所有结果、绘图和日志均已保存至 '{results_dir}'。")
+            best_params_dict = {p.name: v for p, v in zip(PARAMETER_SPACE, result.x)}
+            print(f"达到的最小损失值: {result.fun:.4f}")
+            print("找到的最佳参数组合:")
+            print(json.dumps(best_params_dict, indent=4))
+            
+            param_filepath = os.path.join(results_dir, "best_parameters.json")
+            save_best_parameters(best_params_dict, param_filepath)
+            
+            convergence_filepath = os.path.join(results_dir, "convergence_plot.png")
+            plot_convergence(result, convergence_filepath)
+
+        except Exception as e:
+            print(f"\n[严重] 针对 '{target_filename}' 的优化进程因错误而终止: {e}")
+
+    print(f"\n\n=========================================================")
+    print("===            所有目标文件均已优化完成            ===")
+    print("=========================================================")

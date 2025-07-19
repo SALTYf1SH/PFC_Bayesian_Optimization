@@ -22,7 +22,7 @@ except ImportError:
 
 # --- Server Configuration ---
 HOST = '127.0.0.1'
-PORT = 50001 
+PORT = 50002 
 
 def _run_single_simulation(params):
     """

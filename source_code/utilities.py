@@ -13,17 +13,24 @@ import pandas as pd
 import matplotlib.pyplot as plt
 from skopt.plots import plot_convergence as skopt_plot_convergence
 
-def setup_results_directory():
+def setup_results_directory(target_filename):
     """
-    Creates a new, timestamped directory for storing the results of an
-    optimization run.
+    Creates a new, uniquely named directory for storing the results of an
+    optimization run, based on the target filename and a timestamp.
+
+    Args:
+        target_filename (str): The name of the target curve file being processed.
 
     Returns:
         tuple: A tuple containing (results_dir_path, curves_dir_path).
     """
-    # Generate a timestamp for the directory name
+    # Sanitize the filename to make it safe for a directory name (e.g., remove .csv)
+    sanitized_name = os.path.splitext(target_filename)[0].replace('.', '_')
     timestamp = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-    results_dir = os.path.join("4_optimization_results", f"run_{timestamp}")
+    
+    # Create a more descriptive directory name
+    run_name = f"run_{sanitized_name}_{timestamp}"
+    results_dir = os.path.join("4_optimization_results", run_name)
     curves_dir = os.path.join(results_dir, "curves")
 
     # Create the directories
@@ -59,7 +66,7 @@ def plot_comparison_curve(sim_df, target_df, iteration, loss, filepath):
     plt.figure(figsize=(10, 7))
     plt.plot(target_df['Strain'], target_df['Stress'], 'k-', label='Target (Experimental)', linewidth=2.5)
     plt.plot(sim_df['Strain'], sim_df['Stress'], 'r--', label=f'Simulation (Iter {iteration})', linewidth=1.5)
-    plt.title(f'Iteration {iteration} - DTW Loss: {loss:.4f}')
+    plt.title(f'Iteration {iteration} - Key-Point Loss: {loss:.4f}')
     plt.xlabel('Strain')
     plt.ylabel('Stress (MPa)')
     plt.legend()
@@ -67,4 +74,3 @@ def plot_comparison_curve(sim_df, target_df, iteration, loss, filepath):
     plt.savefig(filepath)
     plt.close() # Close the plot to free up memory
     print(f"Comparison plot for iteration {iteration} saved.")
-

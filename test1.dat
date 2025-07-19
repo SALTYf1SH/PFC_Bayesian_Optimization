@@ -1,0 +1,150 @@
+; PFC2D Uniaxial Compression Test Simulation
+; -------------------------------------------
+; 本程序演示了在PFC2D中进行单轴压缩试验的完整流程，
+; 包括：生成颗粒试样、固结、平行粘结、伺服加载和数据记录。
+
+; ==================================================================
+; 1. 初始化模型
+; ==================================================================
+pfc model new
+pfc model dimension 2
+command
+  ; --- 定义模型参数 ---
+  ; 试样几何参数
+  global spec_width = 0.05   ; 试样宽度 (m)
+  global spec_height = 0.1   ; 试样高度 (m)
+  ; 颗粒尺寸
+  global rad_min = 0.0005    ; 最小颗粒半径 (m)
+  global rad_max = 0.0008    ; 最大颗粒半径 (m)
+  ; 墙体伺服控制加载速率
+  global load_rate = -1e-5   ; 压缩速率 (m/step), 负号表示向下
+  ; 最终应变
+  global max_strain = -0.01  ; 目标应变 (负号表示压缩)
+
+  ; --- 定义微观力学参数 ---
+  ; 颗粒属性
+  global ball_den = 2650.0   ; 颗粒密度 (kg/m^3)
+  ; 线性接触模型 (颗粒间)
+  global lin_emod = 15e9     ; 接触有效模量 (Pa)
+  global lin_kratio = 1.5    ; 接触法向/切向刚度比
+  global lin_fric = 0.5      ; 颗粒间摩擦系数
+  ; 平行粘结模型 (模拟胶结)
+  global pb_emod = 15e9      ; 粘结有效模量 (Pa)
+  global pb_kratio = 1.5     ; 粘结法向/切向刚度比
+  global pb_ten_str = 30e6   ; 粘结抗拉强度 (Pa)
+  global pb_coh = 50e6       ; 粘结粘聚力 (Pa)
+  global pb_fric = 30.0      ; 粘结内摩擦角 (度)
+end
+
+; 设置计算域，留出一些额外空间
+pfc domain extent -@spec_width @spec_width
+
+; ==================================================================
+; 2. 生成颗粒试样
+; ==================================================================
+; --- 创建一个临时的墙体容器用于生成颗粒 ---
+pfc wall create plane position (0, -@spec_height/2.0) dip 0 ddir 90 ; bottom
+pfc wall create plane position (0, @spec_height/2.0)  dip 0 ddir -90; top
+pfc wall create plane position (-@spec_width/2.0, 0)  dip 90 ddir 0 ; left
+pfc wall create plane position (@spec_width/2.0, 0)   dip 90 ddir 180; right
+
+; --- 设置默认接触模型为线性模型 ---
+pfc contact cmat default model linear method emod @lin_emod kratio @lin_kratio
+
+; --- 在容器内生成颗粒 ---
+pfc ball distribute porosity 0.16 radius @rad_min @rad_max
+
+; --- 赋予颗粒密度 ---
+pfc ball attribute density @ball_den
+
+; --- 让颗粒在容器内初步安顿 ---
+pfc model cycle 2000
+
+; ==================================================================
+; 3. 固结与粘结
+; ==================================================================
+; --- 安装平行粘结 ---
+; 只有当颗粒间的间隙小于某个值时才创建粘结
+pfc contact method pb_linear property pb_emod @pb_emod pb_kratio @pb_kratio ...
+                                      pb_fric @pb_fric pb_coh @pb_coh pb_ten_str @pb_ten_str
+pfc contact bond parallel gap 1e-6
+
+; --- 删除左右两个用于生成试样的临时墙体 ---
+pfc wall delete range id 3 4
+
+; --- 让带有粘结的试样达到平衡 ---
+pfc model solve
+
+; --- 保存初始状态 ---
+pfc model save 'uniaxial_initial_state.pfc'
+
+; ==================================================================
+; 4. 设置加载条件并进行压缩
+; ==================================================================
+; --- 创建上下加载墙 (platens) ---
+; 删除旧的上下墙
+pfc wall delete range id 1 2
+; 创建新的加载墙
+pfc wall create plane position (0, @spec_height/2.0) dip 0 ddir -90 id 10 ; Top platen
+pfc wall create plane position (0, -@spec_height/2.0) dip 0 ddir 90 id 11 ; Bottom platen
+
+; --- 定义FISH函数用于伺服加载和数据记录 ---
+fish def servo_and_record
+  ; 获取上下墙体
+  w_top = wall.find(10)
+  w_bot = wall.find(11)
+
+  ; --- 伺服控制 ---
+  ; 计算当前墙体反力
+  f_top = wall.force_contact.y(w_top)
+  f_bot = wall.force_contact.y(w_bot)
+  ; 计算平均轴向应力 (力/宽度, 2D中宽度即面积)
+  stress_y = (abs(f_top) + abs(f_bot)) / (2.0 * @spec_width)
+
+  ; --- 数据记录 ---
+  ; 计算轴向应变 (位移除以初始高度)
+  disp_y = wall.disp.y(w_top) - wall.disp.y(w_bot)
+  strain_y = disp_y / @spec_height
+
+  ; 将应力和应变存入全局历史变量
+  ; PFC会自动将这些变量与计算步数关联
+  history add stress_y id 1
+  history add strain_y id 2
+
+  ; --- 检查终止条件 ---
+  if strain_y < @max_strain
+    command
+      pfc model solve halt
+    end
+  endif
+end
+
+; --- 设置历史记录 ---
+pfc history clear
+pfc history add fish stress_y id 1
+pfc history add fish strain_y id 2
+
+; --- 开始伺服加载循环 ---
+; 设置墙体速度
+pfc wall attribute vel (0, @load_rate) range id 10
+pfc wall attribute vel (0, -@load_rate) range id 11
+; 每次执行100个cycle后，调用一次FISH函数
+pfc model solve fish-halt servo_and_record fish-period 100
+
+; ==================================================================
+; 5. 结果处理
+; ==================================================================
+; --- 保存最终状态 ---
+pfc model save 'uniaxial_final_state.pfc'
+
+; --- 导出历史数据为文本文件 ---
+pfc history export 1 2 file 'stress_strain_curve.txt'
+
+; --- 绘制应力-应变曲线图 ---
+pfc plot new 'Stress-Strain Curve'
+pfc plot add history 2 vs 1
+pfc plot y-axis label 'Axial Stress (Pa)'
+pfc plot x-axis label 'Axial Strain'
+pfc plot show
+
+; --- 结束 ---
